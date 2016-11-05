@@ -23,7 +23,7 @@ is virtually no down-time.
 
 """
 
-from __future__ import with_statement
+
 
 import os
 import logging
@@ -34,6 +34,12 @@ import numpy
 
 import gensim
 from sqlitedict import SqliteDict # needs sqlitedict: run "sudo easy_install sqlitedict"
+
+class CustomRLock(threading._PyRLock):
+
+  @property
+  def acquired(self):
+    return bool(self._count)
 
 
 logger = logging.getLogger('gensim.similarities.simserver')
@@ -71,6 +77,7 @@ class SimIndex(gensim.utils.SaveLoad):
         Spill index shards to disk after every `shardsize` documents.
         In similarity queries, return only the `topsims` most similar documents.
         """
+        self.norm_l2 = None
         self.fname = fname
         self.shardsize = int(shardsize)
         self.topsims = int(topsims)
@@ -79,6 +86,7 @@ class SimIndex(gensim.utils.SaveLoad):
         self.id2sims = SqliteDict(self.fname + '.id2sims', journal_mode=JOURNAL_MODE) # precomputed top similar: document id -> [(doc_id, similarity)]
         self.qindex = gensim.similarities.Similarity(self.fname + '.idx', corpus=None,
             num_best=None, num_features=num_features, shardsize=shardsize)
+        self.norm_l2 = None
         self.length = 0
 
     def save(self, fname):
@@ -128,9 +136,9 @@ class SimIndex(gensim.utils.SaveLoad):
             try:
                 os.remove(fname)
                 logger.info("deleted %s" % fname)
-            except Exception, e:
+            except Exception as e:
                 logger.warning("failed to delete %s: %s" % (fname, e))
-        for val in self.__dict__.keys():
+        for val in list(self.__dict__.keys()):
             try:
                 delattr(self, val)
             except:
@@ -143,10 +151,11 @@ class SimIndex(gensim.utils.SaveLoad):
         the same id). `fresh_docs` is a dictionary-like object (=dict, sqlitedict, shelve etc)
         that maps document_id->document.
         """
-        docids = fresh_docs.keys()
+        docids = list(fresh_docs.keys())
         vectors = (model.docs2vecs(fresh_docs[docid] for docid in docids))
         logger.info("adding %i documents to %s" % (len(docids), self))
         self.qindex.add_documents(vectors)
+        self.norm_l2 = gensim.models.normmodel.NormModel(vectors)
         self.qindex.save()
         self.update_ids(docids)
 
@@ -172,7 +181,7 @@ class SimIndex(gensim.utils.SaveLoad):
 
     def update_mappings(self):
         """Synchronize id<->position mappings."""
-        self.pos2id = dict((v, k) for k, v in self.id2pos.iteritems())
+        self.pos2id = dict((v, k) for k, v in self.id2pos.items())
         assert len(self.pos2id) == len(self.id2pos), "duplicate ids or positions detected"
 
 
@@ -235,18 +244,24 @@ class SimIndex(gensim.utils.SaveLoad):
         Find the most similar documents to a given vector (=already processed document).
         """
         if normalize is None:
-            normalize = self.qindex.normalize
-        norm, self.qindex.normalize = self.qindex.normalize, normalize # store old value
+            #normalize = self.qindex.normalize
+            #self.norm_l2 = NormModel(corpus)
+            normalize = self.norm_l2.normalize
+        #norm, self.qindex.normalize = self.qindex.normalize, normalize # store old value
+        #norm, self.qindex.normalize = self.norm_l2.normalize, normalize # store old value
+        norm, self.norm_l2.normalize = self.norm_l2.normalize, normalize # store old value
         self.qindex.num_best = self.topsims
         sims = self.qindex[vec]
-        self.qindex.normalize = norm # restore old value of qindex.normalize
+        #self.qindex.normalize = norm # restore old value of qindex.normalize
+        self.norm_l2.normalize = norm # restore old value of qindex.normalize
         return self.sims2scores(sims)
 
 
     def merge(self, other):
         """Merge documents from the other index. Update precomputed similarities
         in the process."""
-        other.qindex.normalize, other.qindex.num_best = False, self.topsims
+        #other.qindex.normalize, other.qindex.num_best = False, self.topsims
+        other.norm_l2.normalize, other.qindex.num_best = False, self.topsims
         # update precomputed "most similar" for old documents (in case some of
         # the new docs make it to the top-N for some of the old documents)
         logger.info("updating old precomputed values")
@@ -276,7 +291,8 @@ class SimIndex(gensim.utils.SaveLoad):
 
         logger.info("precomputing most similar for the fresh index")
         pos, lenother = 0, len(other.qindex)
-        norm, self.qindex.normalize = self.qindex.normalize, False
+        #norm, self.qindex.normalize = self.qindex.normalize, False
+        norm, self.norm_l2.normalize = self.norm_l2.normalize, False
         topsims, self.qindex.num_best = self.qindex.num_best, self.topsims
         for chunk in other.qindex.iter_chunks():
             for sims in self.qindex[chunk]:
@@ -287,7 +303,8 @@ class SimIndex(gensim.utils.SaveLoad):
                 pos += 1
                 if pos % 10000 == 0:
                     logger.info("PROGRESS: precomputed doc #%i/%i" % (pos, lenother))
-        self.qindex.normalize, self.qindex.num_best = norm, topsims
+        #self.qindex.normalize, self.qindex.num_best = norm, topsims
+        self.norm_l2.normalize, self.qindex.num_best = norm, topsims
         self.id2sims.sync()
 
 
@@ -298,7 +315,7 @@ class SimIndex(gensim.utils.SaveLoad):
         return docid in self.id2pos
 
     def keys(self):
-        return self.id2pos.keys()
+        return list(self.id2pos.keys())
 
     def __str__(self):
         return "SimIndex(%i docs, %i real size)" % (len(self), self.length)
@@ -328,7 +345,7 @@ class SimModel(gensim.utils.SaveLoad):
             params = {}
         self.params = params
         logger.info("collecting %i document ids" % len(fresh_docs))
-        docids = fresh_docs.keys()
+        docids = list(fresh_docs.keys())
         logger.info("creating model from %s documents" % len(docids))
         preprocessed = lambda: (fresh_docs[docid]['tokens'] for docid in docids)
 
@@ -453,7 +470,7 @@ class SimServer(object):
             raise ValueError("%r must be a writable directory" % basename)
         self.basename = basename
         self.use_locks = use_locks
-        self.lock_update = threading.RLock() if use_locks else gensim.utils.nocm
+        self.lock_update = CustomRLock() if use_locks else gensim.utils.nocm
         try:
             self.fresh_index = SimIndex.load(self.location('index_fresh'))
         except:
@@ -612,7 +629,7 @@ class SimServer(object):
             self.fresh_index = SimIndex(self.location('index_fresh'), self.model.num_features)
         self.fresh_index.index_documents(self.fresh_docs, self.model)
         if self.opt_index is not None:
-            self.opt_index.delete(self.fresh_docs.keys())
+            self.opt_index.delete(list(self.fresh_docs.keys()))
         logger.info("storing document payloads")
         for docid in self.fresh_docs:
             payload = self.fresh_docs[docid].get('payload', None)
@@ -673,7 +690,7 @@ class SimServer(object):
                 if os.path.exists(fname):
                     os.remove(fname)
                     logger.info("deleted %s" % fname)
-            except Exception, e:
+            except Exception as e:
                 logger.warning("failed to delete %s" % fname)
         self.payload = SqliteDict(self.location('payload'), autocommit=True, journal_mode=JOURNAL_MODE)
 
@@ -685,7 +702,7 @@ class SimServer(object):
                 if os.path.exists(fname):
                     os.remove(fname)
                     logger.info("deleted %s" % fname)
-            except Exception, e:
+            except Exception as e:
                 logger.warning("failed to delete %s" % fname)
             self.model = None
         self.flush(save_index=True, save_model=True, clear_buffer=True)
@@ -702,7 +719,7 @@ class SimServer(object):
 
 
     def is_locked(self):
-        return self.use_locks and self.lock_update._RLock__count > 0
+        return self.use_locks and self.lock_update.acquired
 
 
     def vec_by_id(self, docid):
@@ -735,7 +752,7 @@ class SimServer(object):
         for index in [self.fresh_index, self.opt_index]:
             if index is not None:
                 index.topsims = max_results
-        if isinstance(doc, basestring):
+        if isinstance(doc, str):
             # query by direct document id
             docid = doc
             if self.opt_index is not None and docid in self.opt_index:
@@ -800,9 +817,9 @@ class SimServer(object):
         """Return ids of all indexed documents."""
         result = []
         if self.fresh_index is not None:
-            result += self.fresh_index.keys()
+            result += list(self.fresh_index.keys())
         if self.opt_index is not None:
-            result += self.opt_index.keys()
+            result += list(self.opt_index.keys())
         return result
 
     def memdebug(self):
@@ -831,7 +848,7 @@ class SessionServer(gensim.utils.SaveLoad):
         self.basedir = basedir
         self.autosession = autosession
         self.use_locks = use_locks
-        self.lock_update = threading.RLock() if use_locks else gensim.utils.nocm
+        self.lock_update = CustomRLock() if use_locks else gensim.utils.nocm
         self.locs = ['a', 'b'] # directories under which to store stable.session data
         try:
             stable = open(self.location('stable')).read().strip()
@@ -870,7 +887,7 @@ class SessionServer(gensim.utils.SaveLoad):
         return len(self.stable)
 
     def keys(self):
-        return self.stable.keys()
+        return list(self.stable.keys())
 
     @gensim.utils.synchronous('lock_update')
     def check_session(self):
@@ -1030,12 +1047,12 @@ class SessionServer(gensim.utils.SaveLoad):
             logger.info("deleted server under %s" % self.basedir)
             # delete everything from self, so that using this object fails results
             # in an error as quickly as possible
-            for val in self.__dict__.keys():
+            for val in list(self.__dict__.keys()):
                 try:
                     delattr(self, val)
                 except:
                     pass
-        except Exception, e:
+        except Exception as e:
             logger.warning("failed to delete SessionServer: %s" % (e))
 
 
